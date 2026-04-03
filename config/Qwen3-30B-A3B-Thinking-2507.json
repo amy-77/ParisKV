@@ -1,0 +1,11 @@
+{
+    "PolarANN": {
+        "sink_size": 4,
+        "local_size": 64,
+        "core": 22,
+        "nprobe": 150,
+        "cache_unit_size": 8,
+        "cache_cluster_num": 450,
+        "codebook_path": "./turboquant/codebooks/codebook_d128_m16_Kr1_Kw64.json"
+    }
+}

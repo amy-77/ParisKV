@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.so
+
+# Build artifacts
+build/
+*.o
+*.d
+.ninja_deps
+.ninja_log
+
+# IDE / Editor
+.vscode/
+.cursor/
+.idea/
+*.swp
+*.swo
+*~
+
+# CUDA / Triton caches
+.cache/
+.triton/
+
+# Model weights (too large for git)
+models/
+
+# Data files
+data/
+
+# Output files
+*.log
+*.jsonl
+*.out
+out/
+recall_plots/
+results/
+
+# HuggingFace cache
+.huggingface/
+
+# OS files
+.DS_Store
+Thumbs.db
