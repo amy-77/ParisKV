@@ -314,8 +314,20 @@ def adaptive_topk_ref(
 
 
 # ============================================================================
-# CUDA kernel 调用入口（占位 / TODO 工程师实现）
+# CUDA kernel 调用入口
 # ============================================================================
+#
+# 设计原则：不刻意融合所有操作，只融合适合融合的部分。
+#
+#   PyTorch / cuBLAS 负责（它们做得更好的部分）:
+#     - sl_logits  = einsum('bhd,bhkd->bhk', q, slk).float() * attn_scale
+#       → cuBLAS tensor core matmul，比手写循环快一个数量级
+#     - cand_logits = cand_scores.float() * attn_scale
+#       → trivial element-wise，1 次 kernel launch
+#
+#   CUDA kernel 融合（适合融合：数据依赖链，拆开需 ~10 次 launch + 中间 tensor）:
+#     global_max → exp → benefit → sum → radix_select → bitonic_sort → cumsum → adaptive_k → gather
+#
 def adaptive_topk_cuda(
     query_avg:        torch.Tensor,
     sink_local_keys:  torch.Tensor,
@@ -328,42 +340,63 @@ def adaptive_topk_cuda(
     topk_cap:         int,
     kernel: Any = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    建议预分配 adaptive_k / topk_indices 后传指针进 kernel，避免每次 cudaMalloc。
-    """
-    bs, kv_heads, _ = query_avg.shape
+    bs, kv_heads, head_dim = query_avg.shape
+    sl_len   = sink_local_keys.shape[2]
     cand_len = cand_scores.shape[-1]
     K_out    = min(topk_cap, cand_len)
     device   = query_avg.device
 
-    # ===== contiguous / device / dtype 检查 =====
-    assert query_avg.is_cuda and query_avg.dtype == torch.bfloat16
-    assert sink_local_keys.is_cuda and sink_local_keys.dtype == torch.bfloat16
-    assert sl_vnorm.is_cuda and sl_vnorm.dtype == torch.float32
-    assert cand_scores.is_cuda and cand_scores.dtype == torch.bfloat16
-    assert cand_indices.is_cuda and cand_indices.dtype == torch.int64
-    assert cand_vnorm.is_cuda and cand_vnorm.dtype == torch.float32
-    assert query_avg.is_contiguous()
-    assert sink_local_keys.is_contiguous()
-    assert sl_vnorm.is_contiguous()
-    assert cand_scores.is_contiguous()
-    assert cand_indices.is_contiguous()
-    assert cand_vnorm.is_contiguous()
+    # ===== 正确性验证 =====
+    # dtype
+    assert query_avg.dtype == torch.bfloat16,       f"query_avg dtype: expected bf16, got {query_avg.dtype}"
+    assert sink_local_keys.dtype == torch.bfloat16,  f"sink_local_keys dtype: expected bf16, got {sink_local_keys.dtype}"
+    assert sl_vnorm.dtype == torch.float32,          f"sl_vnorm dtype: expected fp32, got {sl_vnorm.dtype}"
+    assert cand_scores.dtype == torch.bfloat16,      f"cand_scores dtype: expected bf16, got {cand_scores.dtype}"
+    assert cand_indices.dtype == torch.int64,         f"cand_indices dtype: expected int64, got {cand_indices.dtype}"
+    assert cand_vnorm.dtype == torch.float32,         f"cand_vnorm dtype: expected fp32, got {cand_vnorm.dtype}"
+    # device & contiguous
+    for name, t in [("query_avg", query_avg), ("sink_local_keys", sink_local_keys),
+                    ("sl_vnorm", sl_vnorm), ("cand_scores", cand_scores),
+                    ("cand_indices", cand_indices), ("cand_vnorm", cand_vnorm)]:
+        assert t.is_cuda,       f"{name} must be on CUDA, got {t.device}"
+        assert t.is_contiguous(), f"{name} must be contiguous"
+    # shape
+    assert sink_local_keys.shape == (bs, kv_heads, sl_len, head_dim), \
+        f"sink_local_keys shape mismatch: {sink_local_keys.shape}"
+    assert sl_vnorm.shape == (bs, kv_heads, sl_len), \
+        f"sl_vnorm shape mismatch: {sl_vnorm.shape}"
+    assert cand_scores.shape == (bs, kv_heads, cand_len), \
+        f"cand_scores shape mismatch: {cand_scores.shape}"
+    assert cand_indices.shape == (bs, kv_heads, cand_len), \
+        f"cand_indices shape mismatch: {cand_indices.shape}"
+    assert cand_vnorm.shape == (bs, kv_heads, cand_len), \
+        f"cand_vnorm shape mismatch: {cand_vnorm.shape}"
+    # scalar params
+    assert 0.0 < threshold <= 1.0,  f"threshold must be in (0, 1], got {threshold}"
+    assert topk_cap > 0,            f"topk_cap must be > 0, got {topk_cap}"
+    assert attn_scale > 0,          f"attn_scale must be > 0, got {attn_scale}"
 
-    # ===== 输出预分配 =====
+    # ===== Step 1: PyTorch matmul + scale（不融合进 CUDA kernel）=====
+    # sl_logits: [bs, kv_heads, sl_len], fp32
+    sl_logits = torch.einsum(
+        'bhd,bhkd->bhk', query_avg, sink_local_keys
+    ).to(torch.float32) * attn_scale
+
+    # cand_logits: [bs, kv_heads, cand_len], fp32
+    cand_logits = cand_scores.to(torch.float32) * attn_scale
+
+    # ===== Step 2: fused CUDA kernel（适合融合的部分）=====
     adaptive_k   = torch.empty(bs, kv_heads,        dtype=torch.int64, device=device)
     topk_indices = torch.empty(bs, kv_heads, K_out, dtype=torch.int64, device=device)
 
     if kernel is None:
         kernel = load_kernel_module("adaptive_topk.cu", "adaptive_topk")
     kernel.adaptive_topk(
-        query_avg,
-        sink_local_keys,
+        sl_logits.contiguous(),
+        cand_logits.contiguous(),
         sl_vnorm,
-        cand_scores,
         cand_indices,
         cand_vnorm,
-        float(attn_scale),
         float(threshold),
         int(K_out),
         adaptive_k,
@@ -373,24 +406,153 @@ def adaptive_topk_cuda(
 
 
 # ============================================================================
-# 单元测试 / 验收脚本
+# 单元测试 / 验收脚本 — ref vs CUDA 对比
 # ============================================================================
-if __name__ == "__main__":
-    inp = generate_test_input(
-        bs=1, kv_heads=8, head_dim=128,
-        sl_len=320, cand_len=12500, topk_cap=2048,
-        threshold=0.95, seed=42,
-    )
 
-    print("===== adaptive_topk_ref (PyTorch) =====")
-    ref_k, ref_idx = adaptive_topk_ref(
+def _call_ref(inp):
+    return adaptive_topk_ref(
         inp["query_avg"], inp["sink_local_keys"], inp["sl_vnorm"],
         inp["cand_scores"], inp["cand_indices"], inp["cand_vnorm"],
         attn_scale=inp["attn_scale"],
         threshold=inp["threshold"],
         topk_cap=inp["topk_cap"],
     )
-    print(f"  adaptive_k = {ref_k.cpu().tolist()}")
-    print(f"  global_k   = {int(ref_k.max().item())}")
-    print(f"  topk_indices.shape = {tuple(ref_idx.shape)}")
 
+
+def _call_cuda(inp, kernel=None):
+    return adaptive_topk_cuda(
+        inp["query_avg"], inp["sink_local_keys"], inp["sl_vnorm"],
+        inp["cand_scores"], inp["cand_indices"], inp["cand_vnorm"],
+        attn_scale=inp["attn_scale"],
+        threshold=inp["threshold"],
+        topk_cap=inp["topk_cap"],
+        kernel=kernel,
+    )
+
+
+def verify_correctness(ref_k, ref_idx, cuda_k, cuda_idx, label=""):
+    """Compare CUDA results against reference.
+    - adaptive_k must match exactly.
+    - topk_indices: for each (b,h), the first adaptive_k[b,h] indices must form
+      the same *set* (tie-break order may differ for equal-benefit items).
+    """
+    bs, kv_heads = ref_k.shape
+    k_match = (ref_k == cuda_k).all().item()
+    print(f"  [{label}] adaptive_k exact match : {'PASS' if k_match else 'FAIL'}")
+    if not k_match:
+        print(f"    ref  adaptive_k = {ref_k.cpu().tolist()}")
+        print(f"    cuda adaptive_k = {cuda_k.cpu().tolist()}")
+        print(f"    diff            = {(ref_k - cuda_k).cpu().tolist()}")
+
+    # Check index sets — for each (b, h), the top adaptive_k indices should be
+    # the same set (order may differ due to tie-breaking).
+    idx_pass = True
+    for b_i in range(bs):
+        for h_i in range(kv_heads):
+            ak = int(ref_k[b_i, h_i].item())
+            ref_set = set(ref_idx[b_i, h_i, :ak].cpu().tolist())
+            cuda_set = set(cuda_idx[b_i, h_i, :ak].cpu().tolist())
+            if ref_set != cuda_set:
+                idx_pass = False
+                diff = ref_set.symmetric_difference(cuda_set)
+                print(f"    (b={b_i}, h={h_i}) index set mismatch, "
+                      f"symmetric_diff size={len(diff)}, ak={ak}")
+    print(f"  [{label}] topk index set match   : {'PASS' if idx_pass else 'FAIL'}")
+    return k_match and idx_pass
+
+
+def benchmark(fn, inp, n_warmup=10, n_iter=100, label=""):
+    """Benchmark a function with CUDA event timing."""
+    import time
+    torch.cuda.synchronize()
+    # Warmup
+    for _ in range(n_warmup):
+        fn(inp)
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event   = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    for _ in range(n_iter):
+        fn(inp)
+    end_event.record()
+    torch.cuda.synchronize()
+
+    elapsed_ms = start_event.elapsed_time(end_event)
+    avg_us = elapsed_ms * 1000.0 / n_iter
+    print(f"  [{label}] avg latency = {avg_us:.1f} us  ({n_iter} iters)")
+    return avg_us
+
+
+if __name__ == "__main__":
+    # ------------------------------------------------------------------
+    # Test configurations covering different shapes
+    # ------------------------------------------------------------------
+    test_configs = [
+        dict(bs=1, kv_heads=8,  head_dim=128, sl_len=320,  cand_len=12500, topk_cap=2048, threshold=0.95, seed=42),
+        dict(bs=1, kv_heads=8,  head_dim=128, sl_len=832,  cand_len=5000,  topk_cap=2048, threshold=0.95, seed=7),
+        dict(bs=2, kv_heads=8,  head_dim=128, sl_len=576,  cand_len=8000,  topk_cap=2048, threshold=0.85, seed=123),
+        dict(bs=1, kv_heads=16, head_dim=128, sl_len=320,  cand_len=15000, topk_cap=2048, threshold=0.95, seed=99),
+    ]
+
+    # ------------------------------------------------------------------
+    # 1. Reference only
+    # ------------------------------------------------------------------
+    print("=" * 72)
+    print(" Phase 1: adaptive_topk_ref (PyTorch reference)")
+    print("=" * 72)
+    for i, cfg in enumerate(test_configs):
+        inp = generate_test_input(**cfg)
+        ref_k, ref_idx = _call_ref(inp)
+        print(f"  config[{i}] adaptive_k = {ref_k.cpu().tolist()}")
+        print(f"  config[{i}] global_k   = {int(ref_k.max().item())}")
+
+    # ------------------------------------------------------------------
+    # 2. Build & load CUDA kernel
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 72)
+    print(" Phase 2: Building adaptive_topk CUDA kernel ...")
+    print("=" * 72)
+    kernel = load_kernel_module(
+        "adaptive_topk.cu", "adaptive_topk",
+        cuda_flags=("-O3", "-std=c++17", "--use_fast_math"),
+    )
+    print("  Kernel module loaded:", kernel)
+
+    # ------------------------------------------------------------------
+    # 3. Correctness verification
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 72)
+    print(" Phase 3: Correctness — ref vs CUDA")
+    print("=" * 72)
+    all_pass = True
+    for i, cfg in enumerate(test_configs):
+        inp = generate_test_input(**cfg)
+        ref_k, ref_idx = _call_ref(inp)
+        cuda_k, cuda_idx = _call_cuda(inp, kernel=kernel)
+        ok = verify_correctness(ref_k, ref_idx, cuda_k, cuda_idx, label=f"cfg{i}")
+        all_pass = all_pass and ok
+
+    print()
+    if all_pass:
+        print("  >>> ALL correctness checks PASSED <<<")
+    else:
+        print("  >>> SOME correctness checks FAILED <<<")
+
+    # ------------------------------------------------------------------
+    # 4. Performance comparison
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 72)
+    print(" Phase 4: Performance comparison (ref vs CUDA)")
+    print("=" * 72)
+    perf_cfg = test_configs[0]  # typical config
+    inp = generate_test_input(**perf_cfg)
+    ref_us  = benchmark(_call_ref,  inp, n_warmup=5, n_iter=50, label="ref ")
+    cuda_us = benchmark(lambda x: _call_cuda(x, kernel=kernel), inp,
+                        n_warmup=10, n_iter=100, label="cuda")
+    if cuda_us > 0:
+        print(f"  Speedup: {ref_us / cuda_us:.2f}x")
