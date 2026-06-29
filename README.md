@@ -5,6 +5,8 @@
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2602.07721"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2602.07721-b31b1b"></a>
+  <a href="https://openreview.net/forum?id=wxD4wTYQXt"><img alt="ICML 2026" src="https://img.shields.io/badge/ICML-2026-purple"></a>
   <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-blue">
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-12.4-green">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.3%2B-ee4c2c">
@@ -12,6 +14,7 @@
 </p>
 
 <p align="center">
+  <a href="#key-insight">Key Insight</a> |
   <a href="#why-pariskv">Why ParisKV</a> |
   <a href="#quick-start">Quick Start</a> |
   <a href="#evaluation">Evaluation</a> |
@@ -26,6 +29,25 @@ fetches only the selected KV pairs from CPU memory through UVA.
 
 <p align="center">
   <img src="assets/pariskv_framework.png" alt="ParisKV framework" width="96%">
+</p>
+
+## Key Insight
+
+ParisKV accelerates long-context LLM inference with drift-robust KV-cache
+retrieval. Unlike methods that learn centroids only from prefill keys, which may
+become stale during long generation, ParisKV maps queries and keys to a stable
+unit-hypersphere space and defines analytic, uniformly distributed centroids
+there. As decoding evolves, newly generated keys remain close to at least one
+centroid, allowing ParisKV to maintain stable retrieval quality under
+distribution drift. With a GPU-native coarse-to-fine retrieval pipeline and
+UVA-based KV-cache offloading, ParisKV scales to million-token contexts while
+matching or even outperforming full attention, achieving up to 2.8x higher
+throughput and 17x / 44x lower decode latency than MagicPIG and PQCache.
+
+<p align="center">
+  <img src="assets/pariskv_retrieval_drift.png" alt="ParisKV retrieval drift results" width="92%">
+  <br>
+  <sub>Fig. 1: ParisKV keeps Recall@100 stable during long decoding, while prefill-only centroids drift away from the evolving key distribution.</sub>
 </p>
 
 ## Why ParisKV
@@ -151,12 +173,24 @@ into subspaces, and stores two GPU-resident summaries:
 
 Full-precision KV vectors can then be asynchronously offloaded to CPU memory.
 
+<p align="center">
+  <img src="assets/pariskv_rotation_codebook.png" alt="ParisKV unit-sphere codebook assignment" width="62%">
+  <br>
+  <sub>Fig. 3: normalize-rotate maps keys to a stable unit sphere where analytic centroids uniformly cover the direction space.</sub>
+</p>
+
 **2. Decode: retrieve in two stages on GPU.**
 
 For each new query, ParisKV first activates the nearest direction centroids in
 each subspace and counts collisions to produce a candidate pool. It then reranks
 those candidates with a fused 4-bit approximate inner-product kernel and selects
 the final Top-k KV indices.
+
+<p align="center">
+  <img src="assets/pariskv_retrieval_algorithm.png" alt="ParisKV coarse candidate generation and reranking" width="96%">
+  <br>
+  <sub>Fig. 4: GPU-native candidate generation prunes by collision counts, then 4-bit RSQ-IP reranking selects the final Top-k KV indices.</sub>
+</p>
 
 **3. Attention: fetch only selected KV pairs.**
 
