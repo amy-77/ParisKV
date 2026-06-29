@@ -1,7 +1,7 @@
 # ParisKV
 
 <p align="center">
-  <b>Fast and drift-robust KV-cache retrieval for long-context LLM inference</b>
+  <b>🔥 [ICML'26] ParisKV: Fast and Drift-Robust KV-Cache Retrieval for Long-Context LLMs</b>
 </p>
 
 <p align="center">
@@ -18,7 +18,7 @@
   <a href="#why-pariskv">Why ParisKV</a> |
   <a href="#quick-start">Quick Start</a> |
   <a href="#evaluation">Evaluation</a> |
-  <a href="#project-layout">Project Layout</a>
+  <a href="#repository-contents">Repository Contents</a>
 </p>
 
 ParisKV is an algorithm-system co-design for accelerating long-context decoding.
@@ -259,26 +259,24 @@ To regenerate the default 8-level magnitude codebook for `m=8`:
 python run/generate_magnitude_levels.py --levels 8 --m 8 --n_samples 10000000
 ```
 
-## Project Layout
+## Repository Contents
 
-```text
-ParisKV/
-|-- attn_hub/                  # PolarANN and FlashAttention wrappers
-|-- cache_hub/                 # KV-cache implementations and CUDA kernels
-|   |-- polar_cache.py         # Main ParisKV cache
-|   |-- collision*/            # Collision-based coarse retrieval kernels
-|   |-- rerank/                # 4-bit fused reranking kernel
-|   |-- topk/                  # Bucket/radix Top-k kernels
-|   |-- gather/                # CPU gather extension
-|   `-- gather_trans/          # UVA H2D KV-fetch kernel
-|-- codebooks/                 # Magnitude quantization levels
-|-- config/                    # Model-specific PolarANN configs
-|-- model_hub/                 # Qwen model integration
-|-- run/                       # LongBench-v2 and AIME evaluation scripts
-|-- tests/                     # Smoke and throughput tests
-|-- turboquant/codebooks/      # PolarANN direction codebooks
-`-- assets/                    # README figures
-```
+- [attn_hub/](attn_hub/) - PolarANN and FlashAttention wrappers.
+- [cache_hub/](cache_hub/) - KV-cache implementations and CUDA kernels.
+  - [polar_cache.py](cache_hub/polar_cache.py) - Main ParisKV cache.
+  - [collision/](cache_hub/collision/) and [collision_fused/](cache_hub/collision_fused/) - Collision-based coarse retrieval kernels.
+  - [rerank/](cache_hub/rerank/) - 4-bit fused reranking kernel.
+  - [topk/](cache_hub/topk/) - Bucket/radix Top-k kernels.
+  - [gather/](cache_hub/gather/) - CPU gather extension.
+  - [gather_trans/](cache_hub/gather_trans/) - UVA H2D KV-fetch kernel.
+  - [adaptive_k_fused/](cache_hub/adaptive_k_fused/) - Adaptive Top-k CUDA kernel.
+- [codebooks/](codebooks/) - Magnitude quantization levels.
+- [config/](config/) - Model-specific PolarANN configs.
+- [model_hub/](model_hub/) - Qwen model integration.
+- [run/](run/) - LongBench-v2 and AIME evaluation scripts.
+- [tests/](tests/) - Smoke and throughput tests.
+- [turboquant/codebooks/](turboquant/codebooks/) - PolarANN direction codebooks.
+- [assets/](assets/) - README figures.
 
 ## Notes
 
