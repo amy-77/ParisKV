@@ -257,7 +257,18 @@ ParisKV/
 
 ## Citation
 
-The ParisKV paper is under review. BibTeX will be added after public release.
+If you use ParisKV in your research, please cite:
+
+```bibtex
+@inproceedings{qi2026pariskv,
+  title     = {ParisKV: Fast and Drift-Robust KV-Cache Retrieval for Long-Context LLMs},
+  author    = {Qi, Yanlin and Chen, Xinhang and Jiang, Huiqiang and Wang, Qitong and Peng, Botao and Palpanas, Themis},
+  booktitle = {Proceedings of the International Conference on Machine Learning (ICML)},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=wxD4wTYQXt},
+  note      = {Poster page: https://icml.cc/virtual/2026/poster/60751}
+}
+```
 
 ## Acknowledgements
 
